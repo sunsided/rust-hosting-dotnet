@@ -2,9 +2,6 @@ mod error;
 pub mod hresult;
 pub mod clr;
 
-use std::env::current_exe;
-use crate::error::{IronCoreResult, IronCoreError};
-
 fn main() {
     let version = "7.0.0";
 

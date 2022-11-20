@@ -12,64 +12,67 @@ pub type CoreClrDomainId = u32;
 pub type CoreClrString = *const std::os::raw::c_char;
 pub type CoreClrDelegatePointer = *const ();
 
-type CoreClrInitializeFn<'a> = lib::Symbol<'a, unsafe extern "C" fn(
+type CoreClrInitializeFn = unsafe extern "system" fn(
     exe_path: CoreClrString,
     app_domain_friendly_name: CoreClrString,
     property_count: isize,
     property_keys: *const CoreClrString,
     property_values: *const CoreClrString,
     host_handle: *mut *mut CoreClrHostHandle,
-    domain_id: *mut CoreClrDomainId) -> u32>;
+    domain_id: *mut CoreClrDomainId) -> u32;
 
-type CoreClrExecuteAssemblyFn<'a> = lib::Symbol<'a, unsafe extern "C" fn(
+type CoreClrExecuteAssemblyFn = unsafe extern "system" fn(
     host_handle: *const CoreClrHostHandle,
     domain_id: CoreClrDomainId,
     argc: isize,
     argv: *const CoreClrString,
     managed_assembly_path: CoreClrString,
-    exit_code: *mut u32) -> u32>;
+    exit_code: *mut u32) -> u32;
 
-type CoreClrCreateDelegateFn<'a> = lib::Symbol<'a, unsafe extern "C" fn(
+type CoreClrCreateDelegateFn = unsafe extern "system" fn(
     host_handle: *const CoreClrHostHandle,
     domain_id: CoreClrDomainId,
     entry_point_assembly_name: CoreClrString,
     entry_point_type_name: CoreClrString,
     entry_point_method_name: CoreClrString,
-    delegate: *mut *const ()) -> u32>;
+    delegate: *mut *const ()) -> u32;
 
-type CoreClrShutdownFn<'a> = lib::Symbol<'a, unsafe extern "C" fn(
+type CoreClrShutdownFn = unsafe extern "system" fn(
     host_handle: *const CoreClrHostHandle,
-    domain_id: CoreClrDomainId) -> u32>;
+    domain_id: CoreClrDomainId) -> u32;
 
-pub struct CoreClrInstance<'a> {
-    symbols: CoreClrSymbols<'a>,
-    libclr: lib::Library,
+pub struct CoreClrInstance {
+    symbols: CoreClrSymbols,
     clr_host_handle: *const CoreClrHostHandle,
     clr_domain_id: CoreClrDomainId,
 }
 
-struct CoreClrSymbols<'lib> {
-    pub coreclr_initialize: CoreClrInitializeFn<'lib>,
-    pub coreclr_execute_assembly: CoreClrExecuteAssemblyFn<'lib>,
-    pub coreclr_create_delegate: CoreClrCreateDelegateFn<'lib>,
-    pub coreclr_shutdown: CoreClrShutdownFn<'lib>
+struct CoreClrSymbols {
+    pub coreclr_initialize: CoreClrInitializeFn,
+    pub coreclr_execute_assembly: CoreClrExecuteAssemblyFn,
+    pub coreclr_create_delegate: CoreClrCreateDelegateFn,
+    pub coreclr_shutdown: CoreClrShutdownFn,
+    // We need to ensure that after dropping this, no further
+    // calls through the function pointers are allowed.
+    clr: lib::Library
 }
 
-impl<'lib> CoreClrSymbols<'lib> {
-    pub fn new(clr: &'lib lib::Library) -> IronCoreResult<Self> {
+impl CoreClrSymbols {
+    pub fn new(clr: lib::Library) -> IronCoreResult<Self> {
         Ok(Self {
-            coreclr_initialize: unsafe { clr.get(b"coreclr_initialize\0")? },
-            coreclr_execute_assembly: unsafe { clr.get(b"coreclr_execute_assembly\0")? },
-            coreclr_create_delegate: unsafe { clr.get(b"coreclr_create_delegate\0")? },
-            coreclr_shutdown: unsafe { clr.get(b"coreclr_shutdown\0")? },
+            coreclr_initialize: *unsafe { clr.get(b"coreclr_initialize\0")? },
+            coreclr_execute_assembly: *unsafe { clr.get(b"coreclr_execute_assembly\0")? },
+            coreclr_create_delegate: *unsafe { clr.get(b"coreclr_create_delegate\0")? },
+            coreclr_shutdown: *unsafe { clr.get(b"coreclr_shutdown\0")? },
+            clr,
         })
     }
 }
 
-impl<'a> CoreClrInstance<'a> {
-    pub fn new<V: AsRef<str>>(version: V, app_paths: String, app_ni_paths: String, native_dll_search_dirs: String) -> IronCoreResult<CoreClrInstance<'a>> {
+impl CoreClrInstance {
+    pub fn new<V: AsRef<str>>(version: V, app_paths: String, app_ni_paths: String, native_dll_search_dirs: String) -> IronCoreResult<CoreClrInstance> {
         let libclr = load_coreclr_library(version.as_ref())?;
-        let symbols = CoreClrSymbols::new(&libclr)?;
+        let symbols = CoreClrSymbols::new(libclr)?;
 
         let exe = std::env::current_exe()?;
         let exe_str = exe.to_str().ok_or(IronCoreError::InvalidExePath)?;
@@ -89,8 +92,8 @@ impl<'a> CoreClrInstance<'a> {
         let mut clr_domain_id: CoreClrDomainId = 0u32;
         let clr_domain_id_ptr: *mut CoreClrDomainId = &mut clr_domain_id;
 
-        let fun = &symbols.coreclr_initialize;
-        let hr = HRESULT::from(fun(
+        let initialize = symbols.coreclr_initialize;
+        let hr = HRESULT::from(unsafe { initialize(
             clr_exe_path.as_ptr(),
             clr_app_domain_friendly_name.as_ptr(),
             clr_property_keys_ptr.len() as isize,
@@ -98,15 +101,16 @@ impl<'a> CoreClrInstance<'a> {
             clr_property_values_ptr.as_ptr(),
             clr_host_handle_ptr,
             clr_domain_id_ptr,
-        ));
+        ) });
         hr.check()?;
 
-        Ok(Self {
-            libclr,
+        let result = Self {
             symbols,
             clr_domain_id,
             clr_host_handle
-        })
+        };
+
+        Ok(result)
     }
 
     pub fn execute_assembly(&self, assembly: &str, args: Vec<&str>) -> IronCoreResult<u32> {
@@ -118,7 +122,7 @@ impl<'a> CoreClrInstance<'a> {
             let mut clr_exit_code = 0u32;
             let clr_exit_code_ptr: *mut u32 = &mut clr_exit_code;
 
-            let coreclr_execute_assembly = &self.symbols.coreclr_execute_assembly;
+            let coreclr_execute_assembly = self.symbols.coreclr_execute_assembly;
             let hr = HRESULT::from(coreclr_execute_assembly(
                 self.clr_host_handle,
                 self.clr_domain_id,
@@ -139,10 +143,10 @@ impl<'a> CoreClrInstance<'a> {
         let clr_entry_point_method_name = CString::new(entry_point_method_name)?;
 
         unsafe {
-            let mut delegate = core::mem::MaybeUninit::<CoreClrDelegatePointer>::uninit();;
+            let mut delegate = core::mem::MaybeUninit::<CoreClrDelegatePointer>::uninit();
             let delegate_ptr = delegate.as_mut_ptr();
 
-            let coreclr_create_delegate = &self.symbols.coreclr_create_delegate;
+            let coreclr_create_delegate = self.symbols.coreclr_create_delegate;
             let hr = HRESULT::from(coreclr_create_delegate(
                 self.clr_host_handle,
                 self.clr_domain_id,
@@ -158,10 +162,10 @@ impl<'a> CoreClrInstance<'a> {
     }
 }
 
-impl<'a> Drop for CoreClrInstance<'a> {
+impl Drop for CoreClrInstance {
     fn drop(&mut self) {
         unsafe {
-            let coreclr_shutdown = &self.symbols.coreclr_shutdown;
+            let coreclr_shutdown = self.symbols.coreclr_shutdown;
             let _ = HRESULT::from(coreclr_shutdown(self.clr_host_handle, self.clr_domain_id));
         }
     }
@@ -228,6 +232,6 @@ fn get_trusted_assemblies<V: AsRef<str>>(version: V) -> IronCoreResult<String> {
 
 pub fn load_coreclr_library<V: AsRef<str>>(version: V) -> IronCoreResult<lib::Library> {
     let libclr_path = get_runtime_path(version)?;
-    let libclr = lib::Library::new(std::ffi::OsString::from(libclr_path))?;
+    let libclr = unsafe { lib::Library::new(std::ffi::OsString::from(libclr_path))? };
     return Ok(libclr);
 }
